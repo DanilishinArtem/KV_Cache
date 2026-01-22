@@ -1,0 +1,34 @@
+{
+  "baseline": {
+    "model": "Qwen/Qwen2-0.5B",
+    "task": "swde",
+    "rkv_enabled": false,
+    "num_samples": 50,
+    "metrics": {
+      "alias": "swde",
+      "contains,none": 0.92,
+      "contains_stderr,none": "N/A"
+    },
+    "memory_stats": {
+      "peak_memory_mb": 8.125,
+      "avg_allocated_mb": 8.125,
+      "avg_reserved_mb": 2646.0
+    }
+  },
+  "rkv": {
+    "model": "Qwen/Qwen2-0.5B",
+    "task": "swde",
+    "rkv_enabled": true,
+    "num_samples": 50,
+    "metrics": {
+      "alias": "swde",
+      "contains,none": 0.92,
+      "contains_stderr,none": "N/A"
+    },
+    "memory_stats": {
+      "peak_memory_mb": 8.125,
+      "avg_allocated_mb": 8.125,
+      "avg_reserved_mb": 2700.0
+    }
+  }
+}
