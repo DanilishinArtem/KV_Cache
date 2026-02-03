@@ -57,119 +57,78 @@ def Quen2Attention_init(self, config, layer_idx, specache_config):
 
 
 def SpeCache_forward(
-    self,
-    hidden_states: torch.Tensor,
-    position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    attention_mask: Optional[torch.Tensor],
-    past_key_values: Optional[Cache] = None,
-    cache_position: Optional[torch.LongTensor] = None,
-    **kwargs,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    
-    input_shape = hidden_states.shape[:-1]
-    # На этапе генерации seq_len всегда 1 (если не используется спекулятивное декодирование)
-    seq_len = hidden_states.shape[1] 
-    
-    # 1. Проекции
-    query_states = self.q_proj(hidden_states).view(*input_shape, self.config.num_attention_heads, self.head_dim).transpose(1, 2)
-    key_states = self.k_proj(hidden_states).view(*input_shape, self.config.num_key_value_heads, self.head_dim).transpose(1, 2)
-    value_states = self.v_proj(hidden_states).view(*input_shape, self.config.num_key_value_heads, self.head_dim).transpose(1, 2)
-    
-    # 2. RoPE
-    cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-    is_prefill = seq_len > 1
-
-    if is_prefill:
-        # print(f'[INFO] Prefill Stage (seq_len = {seq_len})')
-        # Prefill Stage (согласно статье)
-        # Вычисляем аттеншн по полной последовательности
-        key_for_attn, value_for_attn = key_states, value_states
-        
-        # Сохраняем всё в SpeCache (Offload C)
-        self.spec_manager.offload_and_update_index(key_states, value_states)
-        # (Опционально) Обновляем стандартный кэш, если он нужен выше по коду
-        if past_key_values is not None:
-            past_key_values.update(key_states, value_states, self.layer_idx, {"sin": sin, "cos": cos, "cache_position": cache_position})
-
-    else:
-        # print(f'[INFO] Decoding Stage (seq_len = {seq_len})')
-        # Decoding Stage (seq_len = 1)
-        # 1. Скорим квантованный индекс на GPU (Look-ahead или текущий)
-        query_states = query_states.view(*input_shape, self.config.num_attention_heads, self.head_dim).transpose(1, 2)
-        scores = self.spec_manager.score_quantized(query_states)
-        # 2. Выбираем индексы и подтягиваем данные (Prefetch C_{Kt})
-        # Примечание: В идеале это должно было случиться в конце предыдущего шага
-        self.spec_manager.prefetch_next_step(scores, self.topk)
-        # 3. Собираем KV для аттеншена (K = [K_prefetch ∪ K_t])
-        key_for_attn, value_for_attn = self.spec_manager.get_full_kv(key_states, value_states)
-        # 4. Обновляем индекс оффлоада текущим токеном
-        self.spec_manager.offload_and_update_index(key_states, value_states)
-    # 3. Настройка маски
-    # Т.к. SpeCache выбирает разреженные токены, стандартная казуальная маска не подходит.
-    # Для seq_len=1 нам нужна маска, разрешающая смотреть на все префетченные токены + текущий.
-    if not is_prefill:
-        # Для eager_attention маска (bsz, 1, q_len, kv_len)
-        kv_seq_len = key_for_attn.shape[-2]
-        attention_mask = torch.zeros(
-            (query_states.shape[0], 1, seq_len, kv_seq_len), 
-            device=query_states.device, dtype=query_states.dtype
-        )
-
-    # 4. Вычисление Attention
-    attn_output, attn_weights = eager_attention_forward(
         self,
-        query_states,
-        key_for_attn,
-        value_for_attn,
-        attention_mask,
-        scaling=self.scaling,
-        dropout=0.0 if not self.training else self.attention_dropout,
-    )
-
-    attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
-    attn_output = self.o_proj(attn_output)
-
-    return attn_output, attn_weights
-
-
-def CausalLM_forward(self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> CausalLMOutputWithPast:
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        input_shape = hidden_states.shape[:-1]
+        seq_len = hidden_states.shape[1] 
+        hidden_shape = (*input_shape, -1, self.head_dim)
 
-        outputs: BaseModelOutputWithPast = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            cache_position=cache_position,
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        is_prefill = seq_len > 1
+
+        if is_prefill:
+            # Prefill Stage (согласно статье)
+            # Вычисляем аттеншн по полной последовательности
+            key_for_attn, value_for_attn = key_states, value_states
+            
+            # Сохраняем всё в SpeCache (Offload C)
+            self.spec_manager.offload_and_update_index(key_states, value_states)
+            # (Опционально) Обновляем стандартный кэш, если он нужен выше по коду
+            if past_key_values is not None:
+                past_key_values.update(key_states, value_states, self.layer_idx, {"sin": sin, "cos": cos, "cache_position": cache_position})
+
+        else:
+            # print(f'[INFO] Decoding Stage (seq_len = {seq_len})')
+            # Decoding Stage (seq_len = 1)
+            # 1. Скорим квантованный индекс на GPU (Look-ahead или текущий)
+            query_states = query_states.view(*input_shape, self.config.num_attention_heads, self.head_dim).transpose(1, 2)
+            scores = self.spec_manager.score_quantized(query_states)
+            # 2. Выбираем индексы и подтягиваем данные (Prefetch C_{Kt})
+            # Примечание: В идеале это должно было случиться в конце предыдущего шага
+            self.spec_manager.prefetch_next_step(scores, self.topk)
+            # 3. Собираем KV для аттеншена (K = [K_prefetch ∪ K_t])
+            key_for_attn, value_for_attn = self.spec_manager.get_full_kv(key_states, value_states)
+            # 4. Обновляем индекс оффлоада текущим токеном
+            self.spec_manager.offload_and_update_index(key_states, value_states)
+        # 3. Настройка маски
+        # Т.к. SpeCache выбирает разреженные токены, стандартная казуальная маска не подходит.
+        # Для seq_len=1 нам нужна маска, разрешающая смотреть на все префетченные токены + текущий.
+        if not is_prefill:
+            # Для eager_attention маска (bsz, 1, q_len, kv_len)
+            kv_seq_len = key_for_attn.shape[-2]
+            attention_mask = torch.zeros(
+                (query_states.shape[0], 1, seq_len, kv_seq_len), 
+                device=query_states.device, dtype=query_states.dtype
+            )
+
+        attention_interface: Callable = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_for_attn,
+            value_for_attn,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,  # main diff with Llama
             **kwargs,
         )
 
-        hidden_states = outputs.last_hidden_state
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
-
-        loss = None
-        if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
-
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
