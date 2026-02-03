@@ -53,7 +53,8 @@ def Quen2Attention_init(self, config, layer_idx, specache_config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     self.bits = specache_config.get("bits", 8)
     self.topk = specache_config.get("topk", 64)
-    self.spec_manager = SpeCacheManager(head_dim=self.head_dim, num_kv_heads=config.num_key_value_heads, num_q_heads=config.num_attention_heads, device=device, bits=self.bits)
+    # self.spec_manager = SpeCacheManager(head_dim=self.head_dim, num_kv_heads=config.num_key_value_heads, num_q_heads=config.num_attention_heads, device=device, bits=self.bits)
+    self.spec_manager = SpeCacheManager(num_kv_heads=config.num_key_value_heads, head_dim=self.head_dim, max_seq_len=config.max_position_embeddings, device=device, dtype=torch.bfloat16, prefetch_k=self.topk)
 
 
 def SpeCache_forward(
@@ -65,70 +66,116 @@ def SpeCache_forward(
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        input_shape = hidden_states.shape[:-1]
-        seq_len = hidden_states.shape[1] 
-        hidden_shape = (*input_shape, -1, self.head_dim)
+        bsz, seq_len, _ = hidden_states.shape
+        head_dim = self.head_dim
+        num_heads = self.config.num_attention_heads
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        # ============================================================
+        # 1. QKV projection
+        # ============================================================
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
 
+        q = q.view(bsz, seq_len, self.config.num_attention_heads, head_dim).transpose(1, 2)
+        k = k.view(bsz, seq_len, self.config.num_key_value_heads, head_dim).transpose(1, 2)
+        v = v.view(bsz, seq_len, self.config.num_key_value_heads, head_dim).transpose(1, 2)
+
+        # ============================================================
+        # 2. RoPE
+        # ============================================================
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         is_prefill = seq_len > 1
 
+        # ============================================================
+        # 3. Prefill stage (FULL attention, FULL offload)
+        # ============================================================
         if is_prefill:
-            # Prefill Stage (согласно статье)
-            # Вычисляем аттеншн по полной последовательности
-            key_for_attn, value_for_attn = key_states, value_states
-            
-            # Сохраняем всё в SpeCache (Offload C)
-            self.spec_manager.offload_and_update_index(key_states, value_states)
-            # (Опционально) Обновляем стандартный кэш, если он нужен выше по коду
-            if past_key_values is not None:
-                past_key_values.update(key_states, value_states, self.layer_idx, {"sin": sin, "cos": cos, "cache_position": cache_position})
+            # используем обычный dense attention
+            key_for_attn = k
+            value_for_attn = v
 
+            # весь KV уходит в SpeCache (CPU + quant index)
+            self.spec_manager.reset()
+            for t in range(seq_len):
+                self.spec_manager.append(
+                    k[:, :, t:t+1, :].squeeze(0),
+                    v[:, :, t:t+1, :].squeeze(0),
+                )
+
+            # при необходимости обновляем HF cache
+            if past_key_values is not None:
+                past_key_values.update(
+                    k, v, self.layer_idx,
+                    {
+                        "sin": sin,
+                        "cos": cos,
+                        "cache_position": cache_position,
+                    },
+                )
+
+        # ============================================================
+        # 4. Decode stage (SpeCache path)
+        # ============================================================
         else:
-            # print(f'[INFO] Decoding Stage (seq_len = {seq_len})')
-            # Decoding Stage (seq_len = 1)
-            # 1. Скорим квантованный индекс на GPU (Look-ahead или текущий)
-            query_states = query_states.view(*input_shape, self.config.num_attention_heads, self.head_dim).transpose(1, 2)
-            scores = self.spec_manager.score_quantized(query_states)
-            # 2. Выбираем индексы и подтягиваем данные (Prefetch C_{Kt})
-            # Примечание: В идеале это должно было случиться в конце предыдущего шага
-            self.spec_manager.prefetch_next_step(scores, self.topk)
-            # 3. Собираем KV для аттеншена (K = [K_prefetch ∪ K_t])
-            key_for_attn, value_for_attn = self.spec_manager.get_full_kv(key_states, value_states)
-            # 4. Обновляем индекс оффлоада текущим токеном
-            self.spec_manager.offload_and_update_index(key_states, value_states)
-        # 3. Настройка маски
-        # Т.к. SpeCache выбирает разреженные токены, стандартная казуальная маска не подходит.
-        # Для seq_len=1 нам нужна маска, разрешающая смотреть на все префетченные токены + текущий.
-        if not is_prefill:
-            # Для eager_attention маска (bsz, 1, q_len, kv_len)
-            kv_seq_len = key_for_attn.shape[-2]
-            attention_mask = torch.zeros(
-                (query_states.shape[0], 1, seq_len, kv_seq_len), 
-                device=query_states.device, dtype=query_states.dtype
+            # q, k, v : (bsz=1, heads, 1, dim)
+            q_t = q
+            k_t = k
+            v_t = v
+
+            # 4.1 Используем PREFETCH из предыдущего шага
+            key_for_attn, value_for_attn = self.spec_manager.get_attention_kv(
+                k_t.squeeze(0),
+                v_t.squeeze(0),
             )
 
-        attention_interface: Callable = eager_attention_forward
+            # приводим к HF-формату
+            key_for_attn = key_for_attn.unsqueeze(0)
+            value_for_attn = value_for_attn.unsqueeze(0)
+
+            # 4.2 Скорим текущий Q → префетч ДЛЯ СЛЕДУЮЩЕГО шага
+            importance = self.spec_manager.score(q_t.squeeze(0))
+            self.spec_manager.prefetch(importance)
+
+            # 4.3 Оффлоадим текущий токен
+            self.spec_manager.append(
+                k_t.squeeze(0),
+                v_t.squeeze(0),
+            )
+
+            # маска: разрешаем смотреть на все выбранные токены
+            kv_seq_len = key_for_attn.shape[-2]
+            attention_mask = torch.zeros(
+                (bsz, 1, 1, kv_seq_len),
+                device=q.device,
+                dtype=q.dtype,
+            )
+
+        # ============================================================
+        # 5. Attention
+        # ============================================================
+        attention_interface = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
             self,
-            query_states,
+            q,
             key_for_attn,
             value_for_attn,
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            sliding_window=self.sliding_window,  # main diff with Llama
+            sliding_window=self.sliding_window,
             **kwargs,
         )
 
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        # ============================================================
+        # 6. Output projection
+        # ============================================================
+        attn_output = attn_output.transpose(1, 2).reshape(bsz, seq_len, -1)
         attn_output = self.o_proj(attn_output)
+
         return attn_output, attn_weights

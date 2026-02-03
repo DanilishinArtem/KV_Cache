@@ -18,129 +18,175 @@ class Timer:
 
 
 class SpeCacheManager:
-    def __init__(self, head_dim: int, num_kv_heads: int, num_q_heads: int, device: torch.device, 
-                 bits: int = 8, max_cache_len: int = 32768):
-        self.timer = Timer()
-        self.head_dim = head_dim
+    """
+    Faithful SpeCache implementation (paper-aligned).
+    """
+
+    def __init__(
+        self,
+        num_kv_heads: int,
+        head_dim: int,
+        max_seq_len: int,
+        device: torch.device,
+        dtype=torch.float16,
+        prefetch_k: int = 64,
+    ):
         self.num_kv_heads = num_kv_heads
-        self.num_q_heads = num_q_heads
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+        self.prefetch_k = prefetch_k
         self.device = device
-        self.bits = bits
-        self.qmin, self.qmax = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
-        
-        # 1. GPU Индекс (C') - фиксированный буфер для скорости
-        self.k_quant_gpu = torch.zeros((num_kv_heads, max_cache_len, head_dim), device=device, dtype=torch.int8)
-        self.k_scales_gpu = torch.zeros((num_kv_heads, max_cache_len, 1), device=device, dtype=torch.float32)
-        self.v_quant_gpu = torch.zeros((num_kv_heads, max_cache_len, head_dim), device=device, dtype=torch.int8)
-        self.v_scales_gpu = torch.zeros((num_kv_heads, max_cache_len, 1), device=device, dtype=torch.float32)
-        
-        # 2. CPU Хранилище (C) - ПРЕДВЫДЕЛЕННОЕ (pin_memory для скорости передачи)
-        self.k_cpu = torch.zeros((num_kv_heads, max_cache_len, head_dim), pin_memory=True)
-        self.v_cpu = torch.zeros((num_kv_heads, max_cache_len, head_dim), pin_memory=True)
-        
-        self.curr_ptr = 0 # Указатель на текущую позицию в кэше
-        self.prefetched_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None 
+        self.dtype = dtype
 
-    def _quantize(self, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Per-head quantization (dim 0: heads)
-        max_vals = t.abs().amax(dim=(1, 2), keepdim=True)
-        scales = (max_vals / self.qmax).clamp(min=1e-9)
-        q = (t / scales).round().clamp(self.qmin, self.qmax).to(torch.int8)
-        return q, scales
+        # ==============================
+        # GPU: quantized keys
+        # ==============================
+        self.k_q = torch.empty(
+            (num_kv_heads, max_seq_len, head_dim),
+            dtype=torch.int8,
+            device=device,
+        )
 
-    def offload_and_update_index(self, K: torch.Tensor, V: torch.Tensor):
-        self.timer.start("offload_and_update_index")
-        """Оптимизированная запись без torch.cat (Zero-copy update)"""
-        k_flat, v_flat = K.squeeze(0), V.squeeze(0)
-        seq_len = k_flat.shape[1]
-        end_ptr = self.curr_ptr + seq_len
+        self.k_scale = torch.empty(
+            (num_kv_heads, max_seq_len, 1),
+            dtype=torch.float16,
+            device=device,
+        )
 
-        # Квантуем
-        q_k, s_k = self._quantize(k_flat)
-        q_v, s_v = self._quantize(v_flat)
+        # ==============================
+        # GPU: exact values
+        # ==============================
+        self.v_gpu = torch.empty(
+            (num_kv_heads, max_seq_len, head_dim),
+            dtype=dtype,
+            device=device,
+        )
 
-        # Пишем в GPU индекс (для скоринга)
-        self.k_quant_gpu[:, self.curr_ptr:end_ptr] = q_k
-        self.k_scales_gpu[:, self.curr_ptr:end_ptr] = s_k.expand(-1, seq_len, -1)
-        self.v_quant_gpu[:, self.curr_ptr:end_ptr] = q_v
-        self.v_scales_gpu[:, self.curr_ptr:end_ptr] = s_v.expand(-1, seq_len, -1)
+        # ==============================
+        # CPU: exact keys (pinned)
+        # ==============================
+        self.k_cpu = torch.empty(
+            (num_kv_heads, max_seq_len, head_dim),
+            dtype=dtype,
+            device="cpu",
+            pin_memory=True,
+        )
 
-        # Пишем в CPU хранилище (Copy Host to Host - очень быстро)
-        self.k_cpu[:, self.curr_ptr:end_ptr].copy_(k_flat, non_blocking=True)
-        self.v_cpu[:, self.curr_ptr:end_ptr].copy_(v_flat, non_blocking=True)
+        self.curr_len = 0
 
-        self.curr_ptr = end_ptr
-        self.timer.end()
+        # Prefetched exact keys (GPU)
+        self.prefetched_k = None
+        self.prefetched_idx = None
 
-    def score_quantized(self, Q: torch.Tensor) -> torch.Tensor:
-        self.timer.start("score_quantized")
-        """Реализует быстрый поиск по C' на GPU"""
-        if self.curr_ptr == 0: return None
-        
-        # Берем только заполненную часть кэша
-        K_q = self.k_quant_gpu[:, :self.curr_ptr]
-        S_k = self.k_scales_gpu[:, :self.curr_ptr]
-        
-        # Деквантуем 'на лету' (в float16/bf16 для скорости, если модель в них)
-        K_deq = K_q.to(Q.dtype) * S_k.to(Q.dtype)
-        
-        # GQA Broadcast
-        if self.num_q_heads != self.num_kv_heads:
-            num_groups = self.num_q_heads // self.num_kv_heads
-            K_deq = K_deq.repeat_interleave(num_groups, dim=0)
-
-        # Matmul: (h, 1, hd) @ (h, hd, seq) -> (h, 1, seq)
-        scores = torch.matmul(Q.squeeze(0), K_deq.transpose(-1, -2))
-        self.timer.end()
-        return scores.mean(dim=(0, 1)) # Aggregated importance
-
-    def prefetch_next_step(self, scores: torch.Tensor, topk: int):
-        self.timer.start("prefetch_next_step")
-        """Асинхронный префетч (K_{t+1})"""
-        if scores is None: return
-        
-        k = min(topk, self.curr_ptr)
-        _, idxs = torch.topk(scores, k=k, dim=-1)
-        unique_indices = idxs.flatten().unique().cpu()
-
-        # Gather на CPU + асинхронный трансфер на GPU
-        # По статье SpeCache: это скрывает задержку PCIe
-        k_batch = self.k_cpu[:, unique_indices].to(self.device, non_blocking=True)
-        v_batch = self.v_cpu[:, unique_indices].to(self.device, non_blocking=True)
-        
-        self.prefetched_kv = (k_batch.unsqueeze(0), v_batch.unsqueeze(0), unique_indices)
-        self.timer.end()
-
-    def get_full_kv(self, current_k: torch.Tensor, current_v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        self.timer.start("get_full_kv")
+    # ============================================================
+    # Quantization (per-token, per-head)
+    # ============================================================
+    @torch.no_grad()
+    def _quantize(self, k: torch.Tensor):
         """
-        Реализует K = [K' ∪ K_{Kt}, Kt]
-        K' - весь квантованный кэш с GPU
-        K_{Kt} - точные значения, подтянутые с CPU (заменяют квантованные в нужных индексах)
+        k: (H, T, D)
         """
-        if self.curr_ptr == 0:
-            return current_k, current_v
+        scale = k.abs().amax(dim=-1, keepdim=True) / 127.0
+        scale.clamp_(min=1e-6)
+        q = torch.round(k / scale).to(torch.int8)
+        return q, scale
 
-        # 1. Деквантуем ВЕСЬ кэш на GPU (K' и V')
-        # По статье V тоже может быть квантован для этого шага
-        # (Если вы не храните V_quant, придется подтягивать всё из CPU, но это медленно.
-        #  SpeCache подразумевает, что на GPU лежит квантованный K' и V')
-        k_full = self.k_quant_gpu[:, :self.curr_ptr].to(current_k.dtype) * self.k_scales_gpu[:, :self.curr_ptr]
-        v_full = self.v_quant_gpu[:, :self.curr_ptr].to(current_v.dtype) * self.v_scales_gpu[:, :self.curr_ptr]
+    # ============================================================
+    # Append KV (called every step)
+    # ============================================================
+    @torch.no_grad()
+    def append(self, k: torch.Tensor, v: torch.Tensor):
+        """
+        k, v: (H, 1, D)
+        """
+        t = self.curr_len
 
-        # 2. Заменяем Top-K "заплатки" на точные данные с CPU
-        if self.prefetched_kv is not None:
-            pk, pv, p_indices = self.prefetched_kv # p_indices - индексы, которые мы тянули
-            
-            # Заменяем в деквантованном кэше ленивые значения на точные
-            k_full[:, p_indices] = pk.squeeze(0)
-            v_full[:, p_indices] = pv.squeeze(0)
+        q, s = self._quantize(k)
 
-        # 3. Добавляем текущий токен Kt
-        # k_full: (h, seq_old, hd), current_k: (1, h, 1, hd)
-        k_final = torch.cat([k_full.unsqueeze(0), current_k], dim=2)
-        v_final = torch.cat([v_full.unsqueeze(0), current_v], dim=2)
+        self.k_q[:, t:t+1] = q
+        self.k_scale[:, t:t+1] = s
+        self.v_gpu[:, t:t+1] = v
 
-        self.timer.end()
+        # exact key → CPU
+        self.k_cpu[:, t:t+1].copy_(k.cpu(), non_blocking=True)
 
-        return k_final, v_final
+        self.curr_len += 1
+
+    # ============================================================
+    # INT8 scoring (NO full dequant!)
+    # ============================================================
+    def score(self, q: torch.Tensor):
+        """
+        q: (num_q_heads, 1, D)
+
+        returns:
+          importance scores per token: (T,)
+        """
+        # map Q-heads → KV-heads (GQA)
+        if q.shape[0] != self.num_kv_heads:
+            repeat = q.shape[0] // self.num_kv_heads
+            q = q.view(self.num_kv_heads, repeat, 1, self.head_dim)
+            q = q.mean(dim=1)
+
+        # q: (H, 1, D)
+        q = q.squeeze(1)  # (H, D)
+
+        # INT8 dot-product approximation:
+        # score ≈ sum(q * (k_q * scale))
+        k_q = self.k_q[:, :self.curr_len]           # (H, T, D)
+        s = self.k_scale[:, :self.curr_len]         # (H, T, 1)
+
+        # matmul in INT space
+        # (H, D) x (H, T, D) → (H, T)
+        scores = torch.einsum("hd,htd->ht", q, k_q.float())
+        scores = scores * s.squeeze(-1)
+
+        # aggregate heads → token importance
+        importance = scores.max(dim=0).values  # (T,)
+
+        return importance
+
+    # ============================================================
+    # Prefetch exact keys (async)
+    # ============================================================
+    @torch.no_grad()
+    def prefetch(self, importance: torch.Tensor):
+        """
+        importance: (T,)
+        """
+        k = min(self.prefetch_k, importance.numel())
+        topk = torch.topk(importance, k=k, largest=True)
+
+        idx = topk.indices.sort().values
+        self.prefetched_idx = idx
+
+        # async CPU → GPU copy
+        self.prefetched_k = self.k_cpu[:, idx].to(
+            device=self.device,
+            non_blocking=True,
+        )
+
+    # ============================================================
+    # Assemble attention KV
+    # ============================================================
+    def get_attention_kv(self, k_curr: torch.Tensor, v_curr: torch.Tensor):
+        """
+        returns:
+          K_attn, V_attn
+        """
+        if self.prefetched_k is None:
+            # fallback: only current token
+            return k_curr, v_curr
+
+        K = torch.cat([self.prefetched_k, k_curr], dim=1)
+        V = torch.cat([self.v_gpu[:, self.prefetched_idx], v_curr], dim=1)
+
+        return K, V
+
+    # ============================================================
+    # Reset (for new sequence)
+    # ============================================================
+    def reset(self):
+        self.curr_len = 0
+        self.prefetched_k = None
+        self.prefetched_idx = None
